@@ -1,34 +1,313 @@
-name: Daily Glacier Data Update
+"""
+update_planet.py
+Runs daily via GitHub Actions.
+Fetches latest PlanetScope imagery, computes glacier/lake metrics,
+uploads CSV to Google Drive.
+No GEE required.
+"""
 
-on:
-  schedule:
-    - cron: '0 3 * * *'   # Every day at 3:00 AM UTC
-  workflow_dispatch:        # Manual trigger from GitHub UI
+import os
+import json
+import time
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from io import BytesIO
 
-jobs:
-  update-glacier-data:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+# ── CONFIG ───────────────────────────────────────────────────
+PLANET_API_KEY = os.environ.get("PLANET_API_KEY", "")
+DRIVE_TOKEN    = os.environ.get("GOOGLE_DRIVE_TOKEN", "")
+FILE_ID        = "1IdDkqsp-vgkgdBaOeLzdFmspSJc7-2vp"
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+AOI_GEOJSON = {
+    "type": "Polygon",
+    "coordinates": [[
+        [71.85, 35.80], [72.20, 35.80],
+        [72.20, 36.10], [71.85, 36.10],
+        [71.85, 35.80]
+    ]]
+}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+# ── SEARCH SCENES ────────────────────────────────────────────
+def search_scenes(days_back=30, max_cloud=0.3):
+    print(f"🔍 Searching Planet scenes (last {days_back} days, cloud <{max_cloud:.0%})...")
+    start = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00Z")
 
-      - name: Install dependencies
-        run: |
-          pip install earthengine-api pandas requests numpy rasterio
+    payload = {
+        "item_types": ["PSScene"],
+        "filter": {
+            "type": "AndFilter",
+            "config": [
+                {"type": "GeometryFilter",  "field_name": "geometry",
+                 "config": AOI_GEOJSON},
+                {"type": "DateRangeFilter", "field_name": "acquired",
+                 "config": {"gte": start}},
+                {"type": "RangeFilter",     "field_name": "cloud_cover",
+                 "config": {"lte": max_cloud}}
+            ]
+        }
+    }
 
-      - name: Run update script
-        env:
-          EE_CREDENTIALS: ${{ secrets.EE_CREDENTIALS }}
-          GOOGLE_DRIVE_TOKEN: ${{ secrets.GOOGLE_DRIVE_TOKEN }}
-          PLANET_API_KEY: ${{ secrets.PLANET_API_KEY }}
-        run: python update_gee.py
+    r = requests.post(
+        "https://api.planet.com/data/v1/quick-search",
+        json=payload,
+        auth=(PLANET_API_KEY, ""),
+        timeout=30
+    )
 
-      - name: Show result
-        run: cat latest_values.csv
+    if r.status_code == 200:
+        features = r.json().get("features", [])
+        print(f"✅ Found {len(features)} scenes")
+        for f in features[:5]:
+            print(f"   📸 {f['id']} | {f['properties']['acquired'][:10]} | "
+                  f"Cloud: {f['properties']['cloud_cover']:.0%}")
+        return features
+    else:
+        print(f"❌ Search failed: {r.status_code} — {r.text[:300]}")
+        return []
+
+# ── ACTIVATE & DOWNLOAD ──────────────────────────────────────
+def get_scene_bytes(scene_id):
+    auth = (PLANET_API_KEY, "")
+    base = f"https://api.planet.com/data/v1/item-types/PSScene/items/{scene_id}/assets"
+
+    for asset_type in ["ortho_analytic_4b_sr", "ortho_analytic_4b"]:
+        print(f"   Trying asset: {asset_type}")
+        r = requests.get(base, auth=auth, timeout=30)
+        if r.status_code != 200:
+            continue
+        assets = r.json()
+        if asset_type not in assets:
+            print(f"   ⚠️ {asset_type} not available")
+            continue
+
+        asset = assets[asset_type]
+
+        # Activate if needed
+        if asset["status"] != "active":
+            print(f"   ⏳ Activating...")
+            requests.get(asset["_links"]["activate"], auth=auth, timeout=30)
+            for i in range(20):
+                time.sleep(30)
+                r2    = requests.get(base, auth=auth, timeout=30)
+                asset = r2.json().get(asset_type, {})
+                print(f"   Status: {asset.get('status')} ({(i+1)*30}s elapsed)")
+                if asset.get("status") == "active":
+                    break
+
+        if asset.get("status") != "active":
+            print(f"   ⚠️ Activation timed out")
+            continue
+
+        # Download
+        print(f"   ⬇️ Downloading...")
+        r3 = requests.get(asset["location"], auth=auth, timeout=300, stream=True)
+        if r3.status_code == 200:
+            data = BytesIO(r3.content)
+            print(f"   ✅ Downloaded ({len(r3.content)/1e6:.1f} MB)")
+            return data
+
+    return None
+
+# ── COMPUTE METRICS ──────────────────────────────────────────
+def compute_metrics(scene_bytes):
+    try:
+        import rasterio
+        from rasterio.io import MemoryFile
+
+        with MemoryFile(scene_bytes) as memfile:
+            with memfile.open() as ds:
+                print(f"   Bands: {ds.count} | CRS: {ds.crs} | "
+                      f"Resolution: {ds.res[0]:.1f}m")
+
+                # Planet 4-band: B(1) G(2) R(3) NIR(4)
+                blue  = ds.read(1).astype(float)
+                green = ds.read(2).astype(float)
+                red   = ds.read(3).astype(float)
+                nir   = ds.read(4).astype(float)
+
+                eps = 1e-10
+
+                # NDSI — snow/ice index
+                ndsi = (green - nir)  / (green + nir  + eps)
+                # NDWI — water index
+                ndwi = (green - nir)  / (green + nir  + eps)
+                # NDVI — vegetation (exclude from glacier)
+                ndvi = (nir   - red)  / (nir   + red  + eps)
+
+                pixel_area_m2  = ds.res[0] * ds.res[1]
+                total_area_km2 = (blue.size * pixel_area_m2) / 1e6
+
+                # Glacier: high NDSI + low NDVI
+                glacier_mask = (ndsi > 0.3) & (ndvi < 0.1)
+                glacier_km2  = np.sum(glacier_mask) * pixel_area_m2 / 1e6
+                glacier_pct  = round((glacier_km2 / total_area_km2) * 100, 2)
+
+                # Lake: high NDWI
+                water_mask = ndwi > 0.2
+                lake_km2   = round(np.sum(water_mask) * pixel_area_m2 / 1e6, 4)
+
+                print(f"   ✅ Glacier: {glacier_pct}% | Lake: {lake_km2} km²")
+                return glacier_pct, lake_km2
+
+    except ImportError:
+        print("   ❌ rasterio not installed")
+        return None, None
+    except Exception as e:
+        print(f"   ❌ Processing error: {e}")
+        return None, None
+
+# ── UPLOAD TO DRIVE ──────────────────────────────────────────
+def upload_to_drive(csv_path):
+    if not DRIVE_TOKEN:
+        print("⚠️ No GOOGLE_DRIVE_TOKEN — skipping upload")
+        return False
+
+    url = (f"https://www.googleapis.com/upload/drive/v3/files/"
+           f"{FILE_ID}?uploadType=media")
+    with open(csv_path, "rb") as f:
+        r = requests.patch(
+            url,
+            headers={"Authorization": f"Bearer {DRIVE_TOKEN}",
+                     "Content-Type": "text/csv"},
+            data=f,
+            timeout=30
+        )
+    if r.status_code == 200:
+        print("✅ Google Drive updated!")
+        return True
+    else:
+        print(f"⚠️ Drive upload failed: {r.status_code} — {r.text[:200]}")
+        return False
+
+# ── MAIN ─────────────────────────────────────────────────────
+def main():
+    print("=" * 60)
+    print(f"🏔️  Planet Glacier Update — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 60)
+
+    # Check secrets
+    print(f"\n🔑 Secrets:")
+    print(f"   PLANET_API_KEY:     {'✅ SET' if PLANET_API_KEY else '❌ MISSING'}")
+    print(f"   GOOGLE_DRIVE_TOKEN: {'✅ SET' if DRIVE_TOKEN    else '❌ MISSING'}")
+
+    if not PLANET_API_KEY:
+        print("❌ PLANET_API_KEY is required!")
+        raise SystemExit(1)
+
+    today = datetime.now()
+
+    # ── Search for latest clear scene ────────────────────────
+    print("\n🌍 Step 1: Search latest PlanetScope scenes...")
+    scenes = search_scenes(days_back=30, max_cloud=0.3)
+
+    # Try wider search if nothing found
+    if not scenes:
+        print("⚠️ No scenes with <30% cloud — trying <50%...")
+        scenes = search_scenes(days_back=60, max_cloud=0.5)
+
+    if not scenes:
+        print("❌ No Planet scenes found for Reshun Valley!")
+        raise SystemExit(1)
+
+    # ── Download and process latest scene ────────────────────
+    curr_glacier = curr_lake = None
+    scene_date   = "unknown"
+    data_source  = "unknown"
+
+    for scene in scenes[:3]:  # Try top 3 scenes
+        scene_id   = scene["id"]
+        scene_date = scene["properties"]["acquired"][:10]
+        cloud      = scene["properties"]["cloud_cover"]
+
+        print(f"\n🌍 Step 2: Processing scene {scene_id} ({scene_date}, {cloud:.0%} cloud)...")
+        scene_bytes = get_scene_bytes(scene_id)
+
+        if scene_bytes:
+            print(f"\n📊 Step 3: Computing glacier/lake metrics...")
+            curr_glacier, curr_lake = compute_metrics(scene_bytes)
+            if curr_glacier is not None:
+                data_source = f"PlanetScope ({scene_date})"
+                print(f"✅ Successfully processed scene from {scene_date}")
+                break
+        else:
+            print(f"⚠️ Could not download scene {scene_id}, trying next...")
+
+    if curr_glacier is None:
+        print("❌ Could not compute metrics from any Planet scene!")
+        raise SystemExit(1)
+
+    # ── Get previous year values from search ─────────────────
+    print("\n⏳ Step 4: Fetching previous year scene for comparison...")
+    prev_glacier = prev_lake = None
+
+    prev_end   = (today - timedelta(days=305)).strftime("%Y-%m-%dT00:00:00Z")
+    prev_start = (today - timedelta(days=395)).strftime("%Y-%m-%dT00:00:00Z")
+
+    prev_payload = {
+        "item_types": ["PSScene"],
+        "filter": {
+            "type": "AndFilter",
+            "config": [
+                {"type": "GeometryFilter",  "field_name": "geometry",
+                 "config": AOI_GEOJSON},
+                {"type": "DateRangeFilter", "field_name": "acquired",
+                 "config": {"gte": prev_start, "lte": prev_end}},
+                {"type": "RangeFilter",     "field_name": "cloud_cover",
+                 "config": {"lte": 0.3}}
+            ]
+        }
+    }
+
+    r = requests.post(
+        "https://api.planet.com/data/v1/quick-search",
+        json=prev_payload,
+        auth=(PLANET_API_KEY, ""),
+        timeout=30
+    )
+
+    if r.status_code == 200:
+        prev_scenes = r.json().get("features", [])
+        print(f"   Found {len(prev_scenes)} previous year scenes")
+        if prev_scenes:
+            prev_scene = prev_scenes[0]
+            prev_id    = prev_scene["id"]
+            prev_date  = prev_scene["properties"]["acquired"][:10]
+            print(f"   📸 Previous scene: {prev_id} | {prev_date}")
+            prev_bytes = get_scene_bytes(prev_id)
+            if prev_bytes:
+                prev_glacier, prev_lake = compute_metrics(prev_bytes)
+                print(f"   ✅ Previous year — Glacier: {prev_glacier}% | Lake: {prev_lake} km²")
+
+    # Use fallback previous values if not found
+    if prev_glacier is None:
+        print("   ⚠️ Using fallback previous values (GEE 2024 data)")
+        prev_glacier = 60.8
+        prev_lake    = 0.039
+
+    # ── Save CSV ──────────────────────────────────────────────
+    print("\n💾 Step 5: Saving CSV...")
+    df = pd.DataFrame([{
+        'glacier_pct':      curr_glacier,
+        'lake_area_km2':    curr_lake,
+        'prev_glacier_pct': prev_glacier,
+        'prev_lake_km2':    prev_lake,
+        'last_updated':     today.strftime('%Y-%m-%d %H:%M'),
+        'data_source':      data_source,
+        'scene_date':       scene_date,
+    }])
+
+    df.to_csv("latest_values.csv", index=False)
+    print(df.to_string(index=False))
+
+    # ── Upload to Drive ───────────────────────────────────────
+    print("\n☁️ Step 6: Uploading to Google Drive...")
+    upload_to_drive("latest_values.csv")
+
+    print("\n🏁 Done!")
+    print(f"   Glacier: {curr_glacier}% | Lake: {curr_lake} km²")
+    print(f"   Source:  {data_source}")
+
+if __name__ == "__main__":
+    main()
